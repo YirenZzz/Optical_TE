@@ -1,6 +1,6 @@
 ## Cross-layer IP-optical restoration-aware TE
-function ECO_TE(GRB_ENV, edges, capacity, flows, demand, scenarios, fiber_scenarios, T, Tf, OpticalTopo, rerouting_K, ILP_LP, time_limit, solve_or_not)
-    printstyled("\n** solving cross-layer RWA-TE Optimal super ILP...\n", color=:yellow)
+function ECO_TE(GRB_ENV, edges, capacity, flows, demand, scenarios, fiber_scenarios, T, Tf, OpticalTopo, rerouting_K, ILP_LP, time_limit, solve_or_not, demand_weight, beta, loss_weight)
+    printstyled("\n** solving cross-layer ECO_TE...\n", color=:yellow)
     nedges = size(edges,1)
     nflows = size(flows,1)
     ntunnels = size(T,1)  # all tunnels routing info on IP edge index
@@ -8,6 +8,14 @@ function ECO_TE(GRB_ENV, edges, capacity, flows, demand, scenarios, fiber_scenar
     nFibers = length(fiber_scenarios[1])
     FibercapacityCode = OpticalTopo["capacityCode"]
     nwavelength = size(FibercapacityCode,2)
+
+    nLevels = 3 # 3 service levels
+
+    tmp = []
+    push!(tmp, demand)
+    push!(tmp, 5*demand)
+    push!(tmp, 20*demand)
+    demand = tmp
 
     tunnel_num = 0 # tunnel number for each flow, some flow may have less number of tunnels, take the largest
     for x in 1:length(Tf)
@@ -134,39 +142,73 @@ function ECO_TE(GRB_ENV, edges, capacity, flows, demand, scenarios, fiber_scenar
 
     ## TE variables for the entire IP layer network
     @variable(model, restored_capacity[1:nscenarios, 1:nedges] >= 0)   # the bw after restoration (if no failure original bw) for each IP links
-    @variable(model, b[1:nflows] >= 0)  # flow bw
-    @variable(model, a[1:nflows,1:tunnel_num] >= 0)  # tunnels bw, tunnels are per flow indexed
+    # @variable(model, b[1:nLevels,1:nflows] >= 0)  # flow bw
+    @variable(model, a[1:nLevels,1:nflows,1:tunnel_num] >= 0)  # tunnels bw, tunnels are per flow indexed
 
-    # Equation 18, [IP] sum tunnel bandwidth larger than flow bandwidth
-    for f in 1:nflows 
-        @constraint(model, sum(a[f,t] for t in 1:size(Tf[f],1)) >= b[f])
+    @variable(model, efficient_bw_ratio[1:nLevels, 1:nscenarios, 1:nflows] >= 0)   
+    @variable(model, restoration_rate[1:nLevels, 1:nflows] >= 0)   
+    @variable(model, flow_loss[1:nflows] >= 0)
+
+    @variable(model, single_path[1:rerouting_K, 1:nscenarios, 1:nedges] >= 0)
+
+    # Equation 1, [IP] sum tunnel bandwidth for certain level is larger than promised flow bandwidth
+    for i in 1:nLevels
+        for f in 1:nflows 
+            @constraint(model, sum(a[i,f,t] for t in 1:size(Tf[f],1)) >= demand_weight * demand[i][f])
+        end
     end
     
-    # Equation 19, [IP] overlapping flows cannot add up to the capacity of that link
+    # Equation 2, [IP] overlapping flows cannot add up to the capacity of that link
     for e in 1:nedges
-        @constraint(model, sum(a[f,t] * L[Tf[f][t],e] for f in 1:nflows for t in 1:size(Tf[f],1)) <= capacity[e])   
+        @constraint(model, sum(a[i,f,t] * L[Tf[f][t],e] for i in 1:nLevels for f in 1:nflows for t in 1:size(Tf[f],1)) <= capacity[e])   
     end
 
-    # Equation 20, [IP] flow bw no larger than demand
-    for f in 1:nflows
-        @constraint(model, b[f] <= demand[f])
+    # Equation 3, [IP] residual tunnels + dynamic restorable tunnels must be able to carry bandwidth for all scenarios
+    for i in 1:nLevels
+        for f in 1:nflows
+            for q in 1:nscenarios
+                @constraint(model, sum(a[i,f,t] for t in Tsf[q][f]) + sum(a[i,f,t] for t in dTaf[q][f]) >= demand_weight * demand[i][f])   
+            end
+        end
     end
 
-    # Equation 21, [IP] residual tunnels + dynamic restorable tunnels must be able to carry bandwidth for all scenarios
-    for f in 1:nflows
+    # Equation 4, [IP] restorable tunnel bandwidth no larger than restored capacity of links
+    for i in 1:nLevels
         for q in 1:nscenarios
-            @constraint(model, sum(a[f,t] for t in Tsf[q][f]) + sum(a[f,t] for t in dTaf[q][f]) >= b[f])   
+            for e in 1:nedges
+                @constraint(model, sum(a[i,f,t] * L[Tf[f][t],e] for f in 1:nflows for t in dTaf[q][f]) <= restored_capacity[q,e]) 
+            end
         end
     end
 
-    # Equation 22, [IP] restorable tunnel bandwidth no larger than restored capacity of links
-    for q in 1:nscenarios
-        for e in 1:nedges
-            @constraint(model, sum(a[f,t] * L[Tf[f][t],e] for f in 1:nflows for t in dTaf[q][f]) <= restored_capacity[q,e]) 
+    # Equation 5, [IP] ratio R_iqf = allocation/demand
+    for i in 1:nLevels
+        for q in 1:nscenarios
+            for f in 1:nflows
+                @constraint(model, efficient_bw_ratio[i,q,f] == (sum(a[i,f,t] for t in dTaf[q][f]) + sum(a[i,f,t] for t in Tsf[q][f])) / demand[i][f])
+            end
         end
     end
 
-    # Equation 23, [optical] wavelength resource used only once if the resource is usable
+    # Equation 6, [IP] restoration rate A = sum(R_iqf)/nscenarios
+    for i in 1:nLevels
+        for f in 1:nflows
+            @constraint(model, restoration_rate[i,f] == sum(efficient_bw_ratio[i,q,f] for q in 1:nscenarios) / nscenarios)
+        end
+    end
+
+    # Equation 7, [IP] loss for each flow
+    for i in 1:nLevels
+        for f in 1:nflows
+            if restoration_rate[i,f] >= beta[i]
+                @constraint(model, flow_loss[f]==0)
+            else
+                @constraint(model, flow_loss[f]==loss_weight[i] * (beta[i] - restoration_rate[i,f]))
+            end
+        end
+    end
+
+    # Equation 8, [optical] wavelength resource used only once if the resource is usable
     for q in 1:nscenarios
         for w in 1:nwavelength 
             for b in 1:nFibers
@@ -175,7 +217,7 @@ function ECO_TE(GRB_ENV, edges, capacity, flows, demand, scenarios, fiber_scenar
         end
     end
 
-    # Equation 24, [optical] translate wavelength usage to IPBranch_bw
+    # Equation 9, [optical] translate wavelength usage to IPBranch_bw
     for q in 1:nscenarios
         for e in 1:nedges
             for t in 1:rerouting_K  # t is the index for branches of the failIP link, not global branch index
@@ -188,7 +230,7 @@ function ECO_TE(GRB_ENV, edges, capacity, flows, demand, scenarios, fiber_scenar
         end
     end
     
-    # Equation 25, [optical] wavelength continuity
+    # Equation 10, [optical] wavelength continuity
     for q in 1:nscenarios
         for t in 1:nIPedgeBranchAll
             for b in IPBranchRoutingFiber[t]
@@ -201,7 +243,7 @@ function ECO_TE(GRB_ENV, edges, capacity, flows, demand, scenarios, fiber_scenar
         end
     end
 
-    # Equation 26, [optical] restored capacity should not exceed the initial capacity
+    # Equation 11, [optical] restored capacity should not exceed the initial capacity
     for q in 1:nscenarios
         for e in 1:nedges 
             @constraint(model, restored_capacity[q,e] <= capacity[e])
@@ -209,12 +251,30 @@ function ECO_TE(GRB_ENV, edges, capacity, flows, demand, scenarios, fiber_scenar
         end
     end
 
-    # Equation 27, [optical] restored bw is the sum of all branches with modulation considered
+    # Equation 12, [optical] restored bw is the sum of all branches with modulation considered
     for q in 1:nscenarios
         for e in 1:nedges
             @constraint(model, restored_capacity[q,e] == 100*sum(IPBranch_bw[q,e,t] for t in 1:rerouting_K)) # modulation is 100 G per wave
         end
     end
+
+    # Equation 13, [optical] 
+    for q in 1:nscenarios
+        for e in 1:nedges
+            @constraint(model, sum(single_path[t,q,e] for t in 1:rerouting_K) == 1)
+        end
+    end
+
+    # Equation 14, [optical] 
+    for q in 1:nscenarios
+        for e in 1:nedges
+            for t in 1:rerouting_K
+                @constraint(model, (1-single_path[t,q,e]) * IPBranch_bw[q,e,t] == 1)
+            end
+        end
+    end
+
+    
 
     # Auxiliary: IP links are bidirectional (bandwidth equal)
     for q in 1:nscenarios
@@ -234,7 +294,7 @@ function ECO_TE(GRB_ENV, edges, capacity, flows, demand, scenarios, fiber_scenar
         end
     end
 
-    @objective(model, Max, sum(b[i] for i in 1:size(b,1)))
+    @objective(model, Min, sum(flow_loss[f] for f in 1:nflows))
     end  # model_def_time end
 
     # get problem size in terms of number of variables and constraints
@@ -256,7 +316,8 @@ function ECO_TE(GRB_ENV, edges, capacity, flows, demand, scenarios, fiber_scenar
         optimize!(model)
         solve_runtime = solve_time(model)
         opt_runtime = solve_runtime + model_def_time
-        return value.(a), value.(b), objective_value(model), solve_runtime, opt_runtime, var_num, sum_constraint
+        # return value.(a), value.(b), objective_value(model), solve_runtime, opt_runtime, var_num, sum_constraint
+        return value.(a), objective_value(model), solve_runtime, opt_runtime, var_num, sum_constraint
     else
         return var_num, sum_constraint
     end
