@@ -1,5 +1,5 @@
 ## Cross-layer IP-optical restoration-aware TE
-function OPTIMAL(GRB_ENV, edges, capacity, flows, demand, scenarios, fiber_scenarios, T, Tf, OpticalTopo, rerouting_K, ILP_LP, time_limit, solve_or_not)
+function ECO_TE(GRB_ENV, edges, capacity, flows, demand, scenarios, fiber_scenarios, T, Tf, OpticalTopo, rerouting_K, ILP_LP, time_limit, solve_or_not)
     printstyled("\n** solving cross-layer RWA-TE Optimal super ILP...\n", color=:yellow)
     nedges = size(edges,1)
     nflows = size(flows,1)
